@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use crossterm::{
     event::{
@@ -86,6 +89,29 @@ fn run_app_internal(
 ) -> io::Result<()> {
     theme::init(options.theme.as_deref());
     highlight::init();
+
+    // When stdout is not a TTY (e.g., in Helix :insert-output), redirect it to /dev/tty
+    // so the TUI can render. crossterm's use-dev-tty feature handles stdin automatically.
+    #[cfg(unix)]
+    if !io::stdout().is_terminal() {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        {
+            Ok(tty) => unsafe {
+                let fd = tty.as_raw_fd();
+                libc::dup2(fd, libc::STDOUT_FILENO);
+            },
+            Err(e) => {
+                eprintln!(
+                    "\x1b[91merror:\x1b[0m Cannot run interactive TUI: no terminal available ({})",
+                    e
+                );
+                return Ok(());
+            }
+        }
+    }
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
