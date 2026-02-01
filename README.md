@@ -10,7 +10,7 @@
 
 ## Special Thanks
 <div align="center">
-  <a href="https://coderabbit.ai">
+  <a href="https://coderabbit.link/lumen-oss">
     <img width="2152" height="313" alt="image" src="https://github.com/user-attachments/assets/a2039a9d-5c9c-4a8e-a063-753c319f2e20" />
   </a>
 </div>
