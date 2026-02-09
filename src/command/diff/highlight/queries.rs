@@ -225,6 +225,142 @@ pub const RUST_HIGHLIGHTS: &str = r#"
 ":" @punctuation.delimiter
 "#;
 
+pub const JAVA_HIGHLIGHTS: &str = r#"
+; Comments
+(line_comment) @comment
+(block_comment) @comment
+
+; Strings and literals
+(string_literal) @string
+(character_literal) @string
+(decimal_integer_literal) @number
+(hex_integer_literal) @number
+(octal_integer_literal) @number
+(binary_integer_literal) @number
+(decimal_floating_point_literal) @number
+(hex_floating_point_literal) @number
+(true) @constant.builtin
+(false) @constant.builtin
+(null_literal) @constant.builtin
+
+; Types
+(type_identifier) @type
+(void_type) @type.builtin
+(integral_type) @type.builtin
+(floating_point_type) @type.builtin
+(boolean_type) @type.builtin
+
+; Classes, interfaces, enums
+(class_declaration name: (identifier) @type)
+(interface_declaration name: (identifier) @type)
+(enum_declaration name: (identifier) @type)
+(record_declaration name: (identifier) @type)
+(annotation_type_declaration name: (identifier) @type)
+
+; Methods and constructors
+(method_declaration name: (identifier) @function)
+(constructor_declaration name: (identifier) @function)
+(method_invocation name: (identifier) @function.method)
+
+; Fields and variables
+(field_access field: (identifier) @property)
+
+; Parameters
+(formal_parameter name: (identifier) @variable.parameter)
+(spread_parameter (variable_declarator name: (identifier) @variable.parameter))
+
+; Annotations
+(marker_annotation name: (identifier) @attribute)
+(annotation name: (identifier) @attribute)
+
+; this/super
+(this) @variable.builtin
+(super) @variable.builtin
+
+; Keywords
+"abstract" @keyword
+"assert" @keyword
+"break" @keyword
+"case" @keyword
+"catch" @keyword
+"class" @keyword
+"continue" @keyword
+"default" @keyword
+"do" @keyword
+"else" @keyword
+"enum" @keyword
+"extends" @keyword
+"final" @keyword
+"finally" @keyword
+"for" @keyword
+"if" @keyword
+"implements" @keyword
+"import" @keyword
+"instanceof" @keyword
+"interface" @keyword
+"native" @keyword
+"new" @keyword
+"package" @keyword
+"private" @keyword
+"protected" @keyword
+"public" @keyword
+"record" @keyword
+"return" @keyword
+"static" @keyword
+"strictfp" @keyword
+"switch" @keyword
+"synchronized" @keyword
+"throw" @keyword
+"throws" @keyword
+"transient" @keyword
+"try" @keyword
+"volatile" @keyword
+"while" @keyword
+"yield" @keyword
+
+; Operators
+"=" @operator
+"+" @operator
+"-" @operator
+"*" @operator
+"/" @operator
+"%" @operator
+"!" @operator
+"<" @operator
+">" @operator
+"&" @operator
+"|" @operator
+"^" @operator
+"~" @operator
+"?" @operator
+"==" @operator
+"!=" @operator
+"<=" @operator
+">=" @operator
+"&&" @operator
+"||" @operator
+"+=" @operator
+"-=" @operator
+"*=" @operator
+"/=" @operator
+"++" @operator
+"--" @operator
+"->" @operator
+"::" @operator
+
+; Punctuation
+"(" @punctuation.bracket
+")" @punctuation.bracket
+"[" @punctuation.bracket
+"]" @punctuation.bracket
+"{" @punctuation.bracket
+"}" @punctuation.bracket
+"." @punctuation.delimiter
+"," @punctuation.delimiter
+";" @punctuation.delimiter
+":" @punctuation.delimiter
+"#;
+
 pub const RUBY_HIGHLIGHTS: &str = r#"
 ; Comments
 (comment) @comment

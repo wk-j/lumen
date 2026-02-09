@@ -237,7 +237,11 @@ mod tests {
         assert!(extensions.contains(&"go"), "Go config should be loaded");
         assert!(extensions.contains(&"json"), "JSON config should be loaded");
         assert!(extensions.contains(&"ex"), "Elixir config should be loaded");
-        assert!(extensions.contains(&"exs"), "Elixir script config should be loaded");
+        assert!(
+            extensions.contains(&"exs"),
+            "Elixir script config should be loaded"
+        );
+        assert!(extensions.contains(&"java"), "Java config should be loaded");
     }
 
     #[test]
@@ -297,7 +301,10 @@ function hello(): string {
 end
 "#;
         let result = highlight_code(code, "test.ex");
-        assert!(!result.is_empty(), "Elixir highlighting should produce output");
+        assert!(
+            !result.is_empty(),
+            "Elixir highlighting should produce output"
+        );
         let has_highlights = result.iter().any(|(_, h)| h.is_some());
         assert!(has_highlights, "Elixir code should have syntax highlights");
     }

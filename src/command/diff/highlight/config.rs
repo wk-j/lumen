@@ -214,5 +214,13 @@ pub static CONFIGS: Lazy<Vec<(&'static str, LanguageConfig)>> = Lazy::new(|| {
         &mut configs,
     );
 
+    load_config(
+        tree_sitter_java::LANGUAGE.into(),
+        "java",
+        JAVA_HIGHLIGHTS,
+        "java",
+        &mut configs,
+    );
+
     configs
 });
