@@ -16,33 +16,103 @@ use crossterm::{
 };
 use ratatui::prelude::*;
 
+use super::coordinates::{extract_selected_text, PanelLayout};
 use super::diff_algo::{compute_side_by_side, find_hunk_starts};
 use super::git::{
     get_current_branch, load_file_diffs, load_pr_file_diffs, load_single_commit_diffs,
 };
 use super::highlight;
 use super::render::{
-    render_diff, render_empty_state, FilePickerItem, KeyBind, KeyBindSection, Modal,
-    ModalFileStatus, ModalResult,
+    render_diff, render_empty_state, truncate_path, FilePickerItem, KeyBind, KeyBindSection, Modal,
+    ModalContent, ModalFileStatus, ModalResult,
 };
+use super::annotation::{AnnotationEditor, AnnotationEditorResult};
 use super::state::{adjust_scroll_for_hunk, adjust_scroll_to_line, AppState, PendingKey};
 use super::theme;
-use super::types::{DiffFullscreen, FileStatus, FocusedPanel, SidebarItem};
+use super::types::{
+    ChangeType, CursorPosition, DiffFullscreen, DiffPanelFocus, FileStatus, FocusedPanel,
+    SelectionMode, SidebarItem,
+};
 use super::watcher::{setup_watcher, WatchEvent};
 use super::{
     fetch_viewed_files, mark_file_as_viewed_async, unmark_file_as_viewed_async, DiffOptions, PrInfo,
 };
+use spinoff::{spinners, Color, Spinner};
+
+use crate::commit_reference::CommitReference;
 use crate::vcs::{StackedCommitInfo, VcsBackend};
+
+/// Navigate to a different commit in stacked mode.
+/// Returns true if navigation was successful.
+fn navigate_stacked_commit(
+    state: &mut AppState,
+    new_index: usize,
+    options: &DiffOptions,
+    backend: &dyn VcsBackend,
+) -> bool {
+    if new_index >= state.stacked_commits.len() {
+        return false;
+    }
+    state.save_stacked_viewed_files();
+    state.current_commit_index = new_index;
+    if let Some(commit) = state.stacked_commits.get(new_index) {
+        let file_diffs = load_single_commit_diffs(&commit.commit_id, &options.file, backend);
+        state.reload(file_diffs, None);
+        state.load_stacked_viewed_files();
+        true
+    } else {
+        false
+    }
+}
+
+/// Adjust sidebar scroll to ensure the selected item is visible.
+fn ensure_sidebar_visible(state: &mut AppState, visible_height: usize) {
+    if state.sidebar_selected >= state.sidebar_scroll + visible_height {
+        state.sidebar_scroll = state.sidebar_selected.saturating_sub(visible_height) + 1;
+    } else if state.sidebar_selected < state.sidebar_scroll {
+        state.sidebar_scroll = state.sidebar_selected;
+    }
+}
+
+/// Format an annotation for display in the annotations list.
+fn format_annotation_preview(annotation: &super::state::HunkAnnotation) -> String {
+    let preview = annotation.content.lines().next().unwrap_or("");
+    let preview = if preview.len() > 40 {
+        format!("{}...", &preview[..40])
+    } else {
+        preview.to_string()
+    };
+    let truncated_filename = truncate_path(&annotation.filename, 30);
+    format!(
+        "{}:{}-{} | {} | {}",
+        truncated_filename,
+        annotation.line_range.0,
+        annotation.line_range.1,
+        preview,
+        annotation.format_time()
+    )
+}
 
 pub fn run_app_with_pr(
     options: DiffOptions,
     pr_info: PrInfo,
     backend: &dyn VcsBackend,
 ) -> io::Result<()> {
+    let mut spinner = Spinner::new(
+        spinners::Dots,
+        format!(
+            "Fetching diff for {}/{}#{}",
+            pr_info.repo_owner, pr_info.repo_name, pr_info.number
+        ),
+        Color::Cyan,
+    );
     match load_pr_file_diffs(&pr_info) {
-        Ok(file_diffs) => run_app_internal(options, Some(pr_info), file_diffs, None, backend),
+        Ok(file_diffs) => {
+            spinner.success(&format!("Fetched {} files", file_diffs.len()));
+            run_app_internal(options, Some(pr_info), file_diffs, None, backend)
+        }
         Err(e) => {
-            eprintln!("\x1b[91merror:\x1b[0m {}", e);
+            spinner.fail(&e);
             std::process::exit(1);
         }
     }
@@ -113,6 +183,39 @@ fn run_app_internal(
         }
     }
 
+    // Initialize state before TUI so we can sync viewed files
+    let mut state = AppState::new(file_diffs, options.focus.as_deref());
+    state.set_vcs_name(backend.name());
+
+    // Set diff reference for annotation export context
+    let diff_ref_str = if let Some(pr) = &pr_info {
+        Some(format!("PR #{} ({}...{})", pr.number, pr.base_ref, pr.head_ref))
+    } else {
+        options.reference.as_ref().map(|r| match r {
+            CommitReference::Single(s) => s.clone(),
+            CommitReference::Range { from, to } => format!("{}..{}", from, to),
+            CommitReference::TripleDots { from, to } => format!("{}...{}", from, to),
+        })
+    };
+    state.set_diff_reference(diff_ref_str);
+
+    // Initialize stacked mode if commits were provided
+    if let Some(commits) = stacked_commits {
+        state.init_stacked_mode(commits);
+    }
+
+    // Load viewed files from GitHub on startup in PR mode (before TUI starts)
+    if let Some(ref pr) = pr_info {
+        let mut spinner = Spinner::new(
+            spinners::Dots,
+            format!("Syncing viewed status for {} files", state.file_diffs.len()),
+            Color::Cyan,
+        );
+        sync_viewed_files_from_github(pr, &mut state);
+        let viewed_count = state.viewed_files.len();
+        spinner.success(&format!("{} files marked as viewed", viewed_count));
+    }
+
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     io::stdout().execute(EnableMouseCapture)?;
@@ -125,21 +228,10 @@ fn run_app_internal(
         None
     };
 
-    let mut state = AppState::new(file_diffs);
-    state.set_vcs_name(backend.name());
     let mut active_modal: Option<Modal> = None;
+    let mut annotation_editor: Option<AnnotationEditor> = None;
     let mut pending_watch_event: Option<WatchEvent> = None;
     let mut pending_events: VecDeque<Event> = VecDeque::new();
-
-    // Initialize stacked mode if commits were provided
-    if let Some(commits) = stacked_commits {
-        state.init_stacked_mode(commits);
-    }
-
-    // Load viewed files from GitHub on startup in PR mode
-    if let Some(ref pr) = pr_info {
-        sync_viewed_files_from_github(pr, &mut state);
-    }
 
     'main: loop {
         if let Some(ref rx) = watch_rx {
@@ -196,13 +288,19 @@ fn run_app_internal(
             state
                 .search_state
                 .update_matches(&side_by_side, state.diff_fullscreen);
-            let branch = get_current_branch(backend);
+            let branch_fallback = get_current_branch(backend);
+            let commit_ref = state
+                .diff_reference
+                .as_deref()
+                .unwrap_or(&branch_fallback);
             terminal.draw(|frame| {
                 render_diff(
                     frame,
                     diff,
                     &state.file_diffs,
                     &state.sidebar_items,
+                    &state.sidebar_visible,
+                    &state.collapsed_dirs,
                     state.current_file,
                     state.scroll,
                     state.h_scroll,
@@ -217,7 +315,7 @@ fn run_app_internal(
                     hunk_count,
                     state.diff_fullscreen,
                     &state.search_state,
-                    &branch,
+                    commit_ref,
                     pr_info.as_ref(),
                     state.focused_hunk,
                     &hunks,
@@ -225,8 +323,15 @@ fn run_app_internal(
                     state.current_commit(),
                     state.current_commit_index,
                     state.stacked_commits.len(),
+                    &side_by_side,
                     state.vcs_name,
+                    &state.annotations,
+                    &state.selection,
                 );
+                // Render annotation editor (on top of everything except modal)
+                if let Some(ref editor) = annotation_editor {
+                    editor.render(frame);
+                }
                 if let Some(ref modal) = active_modal {
                     modal.render(frame);
                 }
@@ -283,31 +388,136 @@ fn run_app_internal(
                         _ => {}
                     }
                 }
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        && annotation_editor.is_some()
+                        && active_modal.is_none() =>
+                {
+                    if let Some(editor) = annotation_editor.as_mut() {
+                        match editor.handle_input(key) {
+                            AnnotationEditorResult::Continue => {}
+                            AnnotationEditorResult::Save => {
+                                state.set_annotation(editor.to_annotation());
+                                annotation_editor = None;
+                            }
+                            AnnotationEditorResult::Delete => {
+                                state.remove_annotation(editor.file_index, editor.hunk_index);
+                                annotation_editor = None;
+                            }
+                            AnnotationEditorResult::Cancel => {
+                                annotation_editor = None;
+                            }
+                        }
+                    }
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press && active_modal.is_some() => {
                     if let Some(ref mut modal) = active_modal {
-                        if let Some(result) = modal.handle_input(key) {
-                            if let ModalResult::FileSelected(file_index) = result {
-                                state.select_file(file_index);
-                                if let Some(idx) = state.sidebar_items.iter().position(|item| {
-                                    matches!(item, SidebarItem::File { file_index: fi, .. } if *fi == state.current_file)
-                                }) {
-                                    state.sidebar_selected = idx;
-                                    let visible_height =
-                                        terminal.size()?.height.saturating_sub(5) as usize;
-                                    if state.sidebar_selected
-                                        >= state.sidebar_scroll + visible_height
+                        let term_height = terminal.size()?.height;
+                        if let Some(result) = modal.handle_input(key, term_height) {
+                            match result {
+                                ModalResult::FileSelected(file_index) => {
+                                    state.reveal_file(file_index);
+                                    state.select_file(file_index);
+                                    if let Some(idx) =
+                                        state.sidebar_visible_index_for_file(state.current_file)
                                     {
-                                        state.sidebar_scroll = state
-                                            .sidebar_selected
-                                            .saturating_sub(visible_height)
-                                            + 1;
-                                    } else if state.sidebar_selected < state.sidebar_scroll {
-                                        state.sidebar_scroll = state.sidebar_selected;
+                                        state.sidebar_selected = idx;
+                                        let visible_height =
+                                            terminal.size()?.height.saturating_sub(5) as usize;
+                                        ensure_sidebar_visible(&mut state, visible_height);
+                                    }
+                                    active_modal = None;
+                                }
+                                ModalResult::AnnotationJump { file_index, hunk_index } => {
+                                    // Jump to the file and hunk
+                                    state.select_file(file_index);
+                                    state.focused_hunk = Some(hunk_index);
+                                    // Scroll to the hunk
+                                    let diff = &state.file_diffs[file_index];
+                                    let side_by_side = compute_side_by_side(
+                                        &diff.old_content,
+                                        &diff.new_content,
+                                        state.settings.tab_width,
+                                    );
+                                    let hunks = find_hunk_starts(&side_by_side);
+                                    if let Some(&hunk_start) = hunks.get(hunk_index) {
+                                        state.scroll = adjust_scroll_for_hunk(
+                                            hunk_start,
+                                            state.scroll,
+                                            visible_height,
+                                            max_scroll,
+                                        );
+                                    }
+                                    active_modal = None;
+                                }
+                                ModalResult::AnnotationEdit { file_index, hunk_index } => {
+                                    // Close modal and open annotation editor for editing
+                                    if let Some(ann) = state.get_annotation(file_index, hunk_index) {
+                                        let editor = AnnotationEditor::new(
+                                            file_index,
+                                            hunk_index,
+                                            ann.filename.clone(),
+                                            ann.line_range,
+                                        ).with_content(&ann.content, ann.created_at);
+                                        annotation_editor = Some(editor);
+                                        // Also jump to the hunk
+                                        state.select_file(file_index);
+                                        state.focused_hunk = Some(hunk_index);
+                                    }
+                                    active_modal = None;
+                                }
+                                ModalResult::AnnotationDelete { file_index, hunk_index } => {
+                                    state.remove_annotation(file_index, hunk_index);
+                                    // Refresh the modal if there are still annotations
+                                    if !state.annotations.is_empty() {
+                                        let mut sorted_annotations = state.annotations.clone();
+                                        sorted_annotations.sort_by_key(|a| a.created_at);
+                                        let items: Vec<String> = sorted_annotations
+                                            .iter()
+                                            .map(format_annotation_preview)
+                                            .collect();
+                                        active_modal = Some(Modal::annotations("Annotations", items, sorted_annotations));
+                                    } else {
+                                        active_modal = None;
                                     }
                                 }
+                                ModalResult::AnnotationCopyAll => {
+                                    // Copy all annotations to clipboard
+                                    let formatted = state.format_annotations_for_export();
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard.set_text(&formatted);
+                                    }
+                                    active_modal = None;
+                                }
+                                ModalResult::AnnotationExport(filename) => {
+                                    // Write annotations to file
+                                    let formatted = state.format_annotations_for_export();
+                                    match std::fs::write(&filename, &formatted) {
+                                        Ok(_) => {
+                                            active_modal = None;
+                                        }
+                                        Err(e) => {
+                                            // Set error message on the modal
+                                            if let Some(ref mut modal) = active_modal {
+                                                if let ModalContent::Annotations { error_message, export_input, .. } = &mut modal.content {
+                                                    *error_message = Some(format!("Failed to write: {}", e));
+                                                    *export_input = None; // Close input, keep modal open
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                ModalResult::Dismissed | ModalResult::Selected(_, _) => {
+                                    active_modal = None;
+                                }
                             }
-                            active_modal = None;
                         }
+                    }
+                }
+                Event::Mouse(mouse) if active_modal.is_some() => {
+                    if let Some(ref mut modal) = active_modal {
+                        let term_height = terminal.size()?.height;
+                        modal.handle_mouse(mouse, term_height);
                     }
                 }
                 Event::Mouse(mouse) if active_modal.is_none() => {
@@ -320,70 +530,147 @@ fn run_app_internal(
                         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                             // Check for stacked mode header arrow clicks
                             if state.stacked_mode && mouse.row < header_height {
-                                // Left arrow click (first 4 columns to cover " ‹ ")
+                                // Left arrow click (first 4 columns to cover " < ")
                                 if mouse.column < 4 && state.current_commit_index > 0 {
-                                    // Save viewed files for current commit before switching
-                                    state.save_stacked_viewed_files();
-                                    state.current_commit_index -= 1;
-                                    if let Some(commit) =
-                                        state.stacked_commits.get(state.current_commit_index)
-                                    {
-                                        let file_diffs = load_single_commit_diffs(
-                                            &commit.commit_id,
-                                            &options.file,
-                                            backend,
-                                        );
-                                        state.reload(file_diffs, None);
-                                        // Load viewed files for new commit
-                                        state.load_stacked_viewed_files();
-                                    }
+                                    let new_index = state.current_commit_index - 1;
+                                    navigate_stacked_commit(&mut state, new_index, &options, backend);
                                 }
-                                // Right arrow click (last 4 columns to cover " › ")
+                                // Right arrow click (last 4 columns to cover " > ")
                                 else if mouse.column >= term_size.width.saturating_sub(4)
                                     && state.current_commit_index
                                         < state.stacked_commits.len().saturating_sub(1)
                                 {
-                                    // Save viewed files for current commit before switching
-                                    state.save_stacked_viewed_files();
-                                    state.current_commit_index += 1;
-                                    if let Some(commit) =
-                                        state.stacked_commits.get(state.current_commit_index)
-                                    {
-                                        let file_diffs = load_single_commit_diffs(
-                                            &commit.commit_id,
-                                            &options.file,
-                                            backend,
-                                        );
-                                        state.reload(file_diffs, None);
-                                        // Load viewed files for new commit
-                                        state.load_stacked_viewed_files();
-                                    }
+                                    let new_index = state.current_commit_index + 1;
+                                    navigate_stacked_commit(&mut state, new_index, &options, backend);
                                 }
                             } else if state.show_sidebar
                                 && mouse.column < sidebar_width
                                 && mouse.row >= header_height
                                 && mouse.row < term_size.height.saturating_sub(footer_height)
                             {
+                                state.clear_selection(); // Clear selection when clicking sidebar
                                 let clicked_row = (mouse.row.saturating_sub(header_height + 1))
                                     as usize
                                     + state.sidebar_scroll;
-                                if clicked_row < state.sidebar_items.len()
-                                    && matches!(
-                                        state.sidebar_items[clicked_row],
-                                        SidebarItem::File { .. }
-                                    )
-                                {
-                                    state.sidebar_selected = clicked_row;
-                                    state.focused_panel = FocusedPanel::DiffView;
-                                    if let SidebarItem::File { file_index, .. } =
-                                        &state.sidebar_items[state.sidebar_selected]
-                                    {
-                                        state.select_file(*file_index);
+                                if clicked_row < state.sidebar_visible_len() {
+                                    let item = state.sidebar_item_at_visible(clicked_row).cloned();
+                                    if let Some(item) = item {
+                                        state.sidebar_selected = clicked_row;
+                                        match item {
+                                            SidebarItem::File { file_index, .. } => {
+                                                state.focused_panel = FocusedPanel::DiffView;
+                                                state.select_file(file_index);
+                                            }
+                                            SidebarItem::Directory { path, .. } => {
+                                                state.focused_panel = FocusedPanel::Sidebar;
+                                                state.toggle_directory(&path);
+                                                let visible_height =
+                                                    term_size.height.saturating_sub(5) as usize;
+                                                if state.sidebar_selected < state.sidebar_scroll {
+                                                    state.sidebar_scroll = state.sidebar_selected;
+                                                } else if state.sidebar_selected
+                                                    >= state.sidebar_scroll + visible_height
+                                                {
+                                                    state.sidebar_scroll = state
+                                                        .sidebar_selected
+                                                        .saturating_sub(visible_height)
+                                                        + 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if mouse.column >= sidebar_width
+                                && mouse.row >= header_height
+                                && mouse.row < term_size.height.saturating_sub(footer_height)
+                                && !state.file_diffs.is_empty()
+                            {
+                                state.focused_panel = FocusedPanel::DiffView;
+
+                                // Calculate layout for selection
+                                let layout = PanelLayout::calculate(
+                                    term_size.width,
+                                    sidebar_width,
+                                    state.show_sidebar,
+                                    state.diff_fullscreen,
+                                );
+
+                                if let Some(panel) = layout.panel_at_x(mouse.column) {
+                                    let is_gutter = layout.is_in_gutter(mouse.column, panel);
+                                    let content_start_y = header_height + 1;
+
+                                    // Fast coordinate calculation without side_by_side
+                                    if mouse.row >= content_start_y {
+                                        let rel_y = (mouse.row - content_start_y) as usize;
+                                        let line = state.scroll as usize + rel_y;
+
+                                        let panel_x = match panel {
+                                            DiffPanelFocus::Old => layout.old_panel_x,
+                                            DiffPanelFocus::New => layout.new_panel_x,
+                                            DiffPanelFocus::None => 0,
+                                        };
+
+                                        let content_offset = layout.content_x_offset(panel);
+                                        let rel_x = mouse.column.saturating_sub(panel_x);
+                                        let column = if rel_x >= content_offset {
+                                            (rel_x - content_offset + state.h_scroll) as usize
+                                        } else {
+                                            0
+                                        };
+
+                                        let mode = if is_gutter {
+                                            SelectionMode::Line
+                                        } else {
+                                            SelectionMode::Character
+                                        };
+                                        let pos = CursorPosition { line, column };
+                                        state.start_selection(panel, pos, mode);
                                     }
                                 }
                             } else if mouse.column >= sidebar_width {
                                 state.focused_panel = FocusedPanel::DiffView;
                             }
+                        }
+                        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                            if state.is_dragging && !state.file_diffs.is_empty() {
+                                // Fast path: compute position without expensive side_by_side calculation
+                                let panel = state.selection.panel;
+                                if panel != DiffPanelFocus::None {
+                                    let content_start_y = header_height + 1;
+
+                                    if mouse.row >= content_start_y {
+                                        let layout = PanelLayout::calculate(
+                                            term_size.width,
+                                            sidebar_width,
+                                            state.show_sidebar,
+                                            state.diff_fullscreen,
+                                        );
+
+                                        let rel_y = (mouse.row - content_start_y) as usize;
+                                        let line = state.scroll as usize + rel_y;
+
+                                        let panel_x = match panel {
+                                            DiffPanelFocus::Old => layout.old_panel_x,
+                                            DiffPanelFocus::New => layout.new_panel_x,
+                                            DiffPanelFocus::None => 0,
+                                        };
+
+                                        let content_offset = layout.content_x_offset(panel);
+                                        let rel_x = mouse.column.saturating_sub(panel_x);
+                                        let column = if rel_x >= content_offset {
+                                            (rel_x - content_offset + state.h_scroll) as usize
+                                        } else {
+                                            0
+                                        };
+
+                                        let pos = CursorPosition { line, column };
+                                        state.extend_selection(pos);
+                                    }
+                                }
+                            }
+                        }
+                        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                            state.end_drag();
                         }
                         MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                             // Coalesce consecutive scroll events to handle fast scrolling.
@@ -424,7 +711,7 @@ fn run_app_internal(
 
                             if in_sidebar {
                                 let max_sidebar_scroll =
-                                    state.sidebar_items.len().saturating_sub(1);
+                                    state.sidebar_visible_len().saturating_sub(1);
                                 if scroll_delta > 0 {
                                     state.sidebar_scroll = (state.sidebar_scroll
                                         + scroll_delta as usize)
@@ -444,6 +731,60 @@ fn run_app_internal(
                                 }
                             }
                         }
+                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+                            // Coalesce consecutive horizontal scroll events
+                            let mut h_scroll_delta: i32 = match mouse.kind {
+                                MouseEventKind::ScrollRight => 4,
+                                MouseEventKind::ScrollLeft => -4,
+                                _ => 0,
+                            };
+
+                            // Coalesce horizontal scroll events
+                            while event::poll(Duration::from_millis(0))? {
+                                let next_event = event::read()?;
+                                match &next_event {
+                                    Event::Mouse(m) => match m.kind {
+                                        MouseEventKind::ScrollRight => h_scroll_delta += 4,
+                                        MouseEventKind::ScrollLeft => h_scroll_delta -= 4,
+                                        _ => {
+                                            pending_events.push_back(next_event);
+                                            break;
+                                        }
+                                    },
+                                    _ => {
+                                        pending_events.push_back(next_event);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Apply the accumulated horizontal scroll delta
+                            let in_sidebar = state.show_sidebar
+                                && mouse.column < sidebar_width
+                                && mouse.row < term_size.height.saturating_sub(footer_height);
+                            let in_diff = mouse.column >= sidebar_width
+                                && mouse.row < term_size.height.saturating_sub(footer_height);
+
+                            if in_sidebar {
+                                if h_scroll_delta > 0 {
+                                    state.sidebar_h_scroll = state
+                                        .sidebar_h_scroll
+                                        .saturating_add(h_scroll_delta as u16);
+                                } else {
+                                    state.sidebar_h_scroll = state
+                                        .sidebar_h_scroll
+                                        .saturating_sub((-h_scroll_delta) as u16);
+                                }
+                            } else if in_diff {
+                                if h_scroll_delta > 0 {
+                                    state.h_scroll =
+                                        state.h_scroll.saturating_add(h_scroll_delta as u16);
+                                } else {
+                                    state.h_scroll =
+                                        state.h_scroll.saturating_sub((-h_scroll_delta) as u16);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -452,6 +793,14 @@ fn run_app_internal(
                         state.pending_key = PendingKey::None;
                     }
                     match key.code {
+                        KeyCode::Esc | KeyCode::Char('c')
+                            if (key.code == KeyCode::Esc
+                                || key.modifiers.contains(KeyModifiers::CONTROL))
+                                && state.selection.is_active() =>
+                        {
+                            // First priority: clear selection
+                            state.clear_selection();
+                        }
                         KeyCode::Esc | KeyCode::Char('c')
                             if (key.code == KeyCode::Esc
                                 || key.modifiers.contains(KeyModifiers::CONTROL))
@@ -467,14 +816,12 @@ fn run_app_internal(
                             state.focused_panel = FocusedPanel::Sidebar;
                             state.show_sidebar = true;
                             if !matches!(
-                                state.sidebar_items.get(state.sidebar_selected),
+                                state.sidebar_item_at_visible(state.sidebar_selected),
                                 Some(SidebarItem::File { .. })
                             ) {
-                                if let Some(idx) = state
-                                    .sidebar_items
-                                    .iter()
-                                    .position(|item| matches!(item, SidebarItem::File { .. }))
-                                {
+                                if let Some(idx) = state.sidebar_visible.iter().position(|idx| {
+                                    matches!(state.sidebar_items[*idx], SidebarItem::File { .. })
+                                }) {
                                     state.sidebar_selected = idx;
                                 }
                             }
@@ -491,24 +838,15 @@ fn run_app_internal(
                         KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if !state.file_diffs.is_empty() {
                                 let mut next = state.sidebar_selected + 1;
-                                while next < state.sidebar_items.len() {
-                                    if let SidebarItem::File { file_index, .. } =
-                                        &state.sidebar_items[next]
+                                while next < state.sidebar_visible_len() {
+                                    if let Some(SidebarItem::File { file_index, .. }) =
+                                        state.sidebar_item_at_visible(next).cloned()
                                     {
                                         state.sidebar_selected = next;
-                                        state.select_file(*file_index);
+                                        state.select_file(file_index);
                                         let visible_height =
                                             terminal.size()?.height.saturating_sub(5) as usize;
-                                        if state.sidebar_selected
-                                            >= state.sidebar_scroll + visible_height
-                                        {
-                                            state.sidebar_scroll = state
-                                                .sidebar_selected
-                                                .saturating_sub(visible_height)
-                                                + 1;
-                                        } else if state.sidebar_selected < state.sidebar_scroll {
-                                            state.sidebar_scroll = state.sidebar_selected;
-                                        }
+                                        ensure_sidebar_visible(&mut state, visible_height);
                                         break;
                                     }
                                     next += 1;
@@ -519,14 +857,12 @@ fn run_app_internal(
                             if !state.file_diffs.is_empty() && state.sidebar_selected > 0 {
                                 let mut prev = state.sidebar_selected - 1;
                                 loop {
-                                    if let SidebarItem::File { file_index, .. } =
-                                        &state.sidebar_items[prev]
+                                    if let Some(SidebarItem::File { file_index, .. }) =
+                                        state.sidebar_item_at_visible(prev).cloned()
                                     {
                                         state.sidebar_selected = prev;
-                                        state.select_file(*file_index);
-                                        if state.sidebar_selected < state.sidebar_scroll {
-                                            state.sidebar_scroll = state.sidebar_selected;
-                                        }
+                                        state.select_file(file_index);
+                                        ensure_sidebar_visible(&mut state, usize::MAX);
                                         break;
                                     }
                                     if prev == 0 {
@@ -541,41 +877,15 @@ fn run_app_internal(
                             if state.stacked_mode
                                 && state.current_commit_index < state.stacked_commits.len() - 1
                             {
-                                // Save viewed files for current commit before switching
-                                state.save_stacked_viewed_files();
-                                state.current_commit_index += 1;
-                                if let Some(commit) =
-                                    state.stacked_commits.get(state.current_commit_index)
-                                {
-                                    let file_diffs = load_single_commit_diffs(
-                                        &commit.commit_id,
-                                        &options.file,
-                                        backend,
-                                    );
-                                    state.reload(file_diffs, None);
-                                    // Load viewed files for new commit
-                                    state.load_stacked_viewed_files();
-                                }
+                                let new_index = state.current_commit_index + 1;
+                                navigate_stacked_commit(&mut state, new_index, &options, backend);
                             }
                         }
                         // Stacked mode: navigate to previous commit
                         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             if state.stacked_mode && state.current_commit_index > 0 {
-                                // Save viewed files for current commit before switching
-                                state.save_stacked_viewed_files();
-                                state.current_commit_index -= 1;
-                                if let Some(commit) =
-                                    state.stacked_commits.get(state.current_commit_index)
-                                {
-                                    let file_diffs = load_single_commit_diffs(
-                                        &commit.commit_id,
-                                        &options.file,
-                                        backend,
-                                    );
-                                    state.reload(file_diffs, None);
-                                    // Load viewed files for new commit
-                                    state.load_stacked_viewed_files();
-                                }
+                                let new_index = state.current_commit_index - 1;
+                                navigate_stacked_commit(&mut state, new_index, &options, backend);
                             }
                         }
                         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -662,21 +972,12 @@ fn run_app_internal(
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             if state.focused_panel == FocusedPanel::Sidebar {
-                                let mut next = state.sidebar_selected + 1;
-                                while next < state.sidebar_items.len() {
-                                    if matches!(state.sidebar_items[next], SidebarItem::File { .. })
-                                    {
-                                        state.sidebar_selected = next;
-                                        break;
-                                    }
-                                    next += 1;
+                                if state.sidebar_selected + 1 < state.sidebar_visible_len() {
+                                    state.sidebar_selected += 1;
                                 }
                                 let visible_height =
                                     terminal.size()?.height.saturating_sub(5) as usize;
-                                if state.sidebar_selected >= state.sidebar_scroll + visible_height {
-                                    state.sidebar_scroll =
-                                        state.sidebar_selected.saturating_sub(visible_height) + 1;
-                                }
+                                ensure_sidebar_visible(&mut state, visible_height);
                             } else {
                                 state.scroll = (state.scroll + 1).min(max_scroll as u16);
                             }
@@ -684,24 +985,10 @@ fn run_app_internal(
                         KeyCode::Up | KeyCode::Char('k') => {
                             if state.focused_panel == FocusedPanel::Sidebar {
                                 if state.sidebar_selected > 0 {
-                                    let mut prev = state.sidebar_selected - 1;
-                                    loop {
-                                        if matches!(
-                                            state.sidebar_items[prev],
-                                            SidebarItem::File { .. }
-                                        ) {
-                                            state.sidebar_selected = prev;
-                                            break;
-                                        }
-                                        if prev == 0 {
-                                            break;
-                                        }
-                                        prev -= 1;
-                                    }
+                                    state.sidebar_selected =
+                                        state.sidebar_selected.saturating_sub(1);
                                 }
-                                if state.sidebar_selected < state.sidebar_scroll {
-                                    state.sidebar_scroll = state.sidebar_selected;
-                                }
+                                ensure_sidebar_visible(&mut state, usize::MAX);
                             } else {
                                 state.scroll = state.scroll.saturating_sub(1);
                             }
@@ -722,85 +1009,111 @@ fn run_app_internal(
                         }
                         KeyCode::Enter => {
                             if state.focused_panel == FocusedPanel::Sidebar
-                                && state.sidebar_selected < state.sidebar_items.len()
+                                && state.sidebar_selected < state.sidebar_visible_len()
                             {
-                                if let SidebarItem::File { file_index, .. } =
-                                    &state.sidebar_items[state.sidebar_selected]
+                                if let Some(item) = state
+                                    .sidebar_item_at_visible(state.sidebar_selected)
+                                    .cloned()
                                 {
-                                    state.select_file(*file_index);
-                                    state.focused_panel = FocusedPanel::DiffView;
+                                    match item {
+                                        SidebarItem::File { file_index, .. } => {
+                                            state.select_file(file_index);
+                                            state.focused_panel = FocusedPanel::DiffView;
+                                        }
+                                        SidebarItem::Directory { path, .. } => {
+                                            state.toggle_directory(&path);
+                                            let visible_height =
+                                                terminal.size()?.height.saturating_sub(5) as usize;
+                                            if state.sidebar_selected < state.sidebar_scroll {
+                                                state.sidebar_scroll = state.sidebar_selected;
+                                            } else if state.sidebar_selected
+                                                >= state.sidebar_scroll + visible_height
+                                            {
+                                                state.sidebar_scroll = state
+                                                    .sidebar_selected
+                                                    .saturating_sub(visible_height)
+                                                    + 1;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                         KeyCode::Char(' ') => {
                             if state.focused_panel == FocusedPanel::Sidebar
-                                && state.sidebar_selected < state.sidebar_items.len()
+                                && state.sidebar_selected < state.sidebar_visible_len()
                             {
-                                match &state.sidebar_items[state.sidebar_selected] {
-                                    SidebarItem::File { file_index, .. } => {
-                                        let file_idx = *file_index;
-                                        let filename = state.file_diffs[file_idx].filename.clone();
-                                        let was_viewed = state.viewed_files.contains(&file_idx);
+                                let selected = state
+                                    .sidebar_item_at_visible(state.sidebar_selected)
+                                    .cloned();
+                                if let Some(selected) = selected {
+                                    match selected {
+                                        SidebarItem::File { file_index, .. } => {
+                                            let file_idx = file_index;
+                                            let filename =
+                                                state.file_diffs[file_idx].filename.clone();
+                                            let was_viewed = state.viewed_files.contains(&file_idx);
 
-                                        // Optimistic update - update local state immediately
-                                        if was_viewed {
-                                            state.viewed_files.remove(&file_idx);
-                                        } else {
-                                            state.viewed_files.insert(file_idx);
-                                        }
-
-                                        // Fire off async API call if in PR mode
-                                        if let Some(ref pr) = pr_info {
+                                            // Optimistic update - update local state immediately
                                             if was_viewed {
-                                                unmark_file_as_viewed_async(pr, &filename);
+                                                state.viewed_files.remove(&file_idx);
                                             } else {
-                                                mark_file_as_viewed_async(pr, &filename);
+                                                state.viewed_files.insert(file_idx);
                                             }
-                                        }
-                                    }
-                                    SidebarItem::Directory { path, .. } => {
-                                        let dir_prefix = format!("{}/", path);
-                                        let child_indices: Vec<usize> = state
-                                            .sidebar_items
-                                            .iter()
-                                            .filter_map(|item| {
-                                                if let SidebarItem::File {
-                                                    path: file_path,
-                                                    file_index,
-                                                    ..
-                                                } = item
-                                                {
-                                                    if file_path.starts_with(&dir_prefix) {
-                                                        return Some(*file_index);
-                                                    }
-                                                }
-                                                None
-                                            })
-                                            .collect();
 
-                                        let all_viewed = child_indices
-                                            .iter()
-                                            .all(|i| state.viewed_files.contains(i));
-
-                                        // Optimistic update - update local state immediately
-                                        if all_viewed {
-                                            for idx in &child_indices {
-                                                state.viewed_files.remove(idx);
-                                            }
-                                        } else {
-                                            for idx in &child_indices {
-                                                state.viewed_files.insert(*idx);
-                                            }
-                                        }
-
-                                        // Fire off async API calls if in PR mode
-                                        if let Some(ref pr) = pr_info {
-                                            for &idx in &child_indices {
-                                                let filename = &state.file_diffs[idx].filename;
-                                                if all_viewed {
-                                                    unmark_file_as_viewed_async(pr, filename);
+                                            // Fire off async API call if in PR mode
+                                            if let Some(ref pr) = pr_info {
+                                                if was_viewed {
+                                                    unmark_file_as_viewed_async(pr, &filename);
                                                 } else {
-                                                    mark_file_as_viewed_async(pr, filename);
+                                                    mark_file_as_viewed_async(pr, &filename);
+                                                }
+                                            }
+                                        }
+                                        SidebarItem::Directory { path, .. } => {
+                                            let dir_prefix = format!("{}/", path);
+                                            let child_indices: Vec<usize> = state
+                                                .sidebar_items
+                                                .iter()
+                                                .filter_map(|item| {
+                                                    if let SidebarItem::File {
+                                                        path: file_path,
+                                                        file_index,
+                                                        ..
+                                                    } = item
+                                                    {
+                                                        if file_path.starts_with(&dir_prefix) {
+                                                            return Some(*file_index);
+                                                        }
+                                                    }
+                                                    None
+                                                })
+                                                .collect();
+
+                                            let all_viewed = child_indices
+                                                .iter()
+                                                .all(|i| state.viewed_files.contains(i));
+
+                                            // Optimistic update - update local state immediately
+                                            if all_viewed {
+                                                for idx in &child_indices {
+                                                    state.viewed_files.remove(idx);
+                                                }
+                                            } else {
+                                                for idx in &child_indices {
+                                                    state.viewed_files.insert(*idx);
+                                                }
+                                            }
+
+                                            // Fire off async API calls if in PR mode
+                                            if let Some(ref pr) = pr_info {
+                                                for &idx in &child_indices {
+                                                    let filename = &state.file_diffs[idx].filename;
+                                                    if all_viewed {
+                                                        unmark_file_as_viewed_async(pr, filename);
+                                                    } else {
+                                                        mark_file_as_viewed_async(pr, filename);
+                                                    }
                                                 }
                                             }
                                         }
@@ -818,29 +1131,33 @@ fn run_app_internal(
                                     state.viewed_files.insert(current_file);
                                     // Move to next unviewed file
                                     let mut next_file: Option<(usize, usize)> = None;
-                                    for (idx, item) in state
-                                        .sidebar_items
+                                    for (visible_idx, item_idx) in state
+                                        .sidebar_visible
                                         .iter()
                                         .enumerate()
                                         .skip(state.sidebar_selected + 1)
                                     {
-                                        if let SidebarItem::File { file_index, .. } = item {
+                                        if let SidebarItem::File { file_index, .. } =
+                                            &state.sidebar_items[*item_idx]
+                                        {
                                             if !state.viewed_files.contains(file_index) {
-                                                next_file = Some((idx, *file_index));
+                                                next_file = Some((visible_idx, *file_index));
                                                 break;
                                             }
                                         }
                                     }
                                     if next_file.is_none() {
-                                        for (idx, item) in state
-                                            .sidebar_items
+                                        for (visible_idx, item_idx) in state
+                                            .sidebar_visible
                                             .iter()
                                             .enumerate()
                                             .take(state.sidebar_selected)
                                         {
-                                            if let SidebarItem::File { file_index, .. } = item {
+                                            if let SidebarItem::File { file_index, .. } =
+                                                &state.sidebar_items[*item_idx]
+                                            {
                                                 if !state.viewed_files.contains(file_index) {
-                                                    next_file = Some((idx, *file_index));
+                                                    next_file = Some((visible_idx, *file_index));
                                                     break;
                                                 }
                                             }
@@ -851,16 +1168,7 @@ fn run_app_internal(
                                         state.select_file(file_idx);
                                         let visible_height =
                                             terminal.size()?.height.saturating_sub(5) as usize;
-                                        if state.sidebar_selected
-                                            >= state.sidebar_scroll + visible_height
-                                        {
-                                            state.sidebar_scroll = state
-                                                .sidebar_selected
-                                                .saturating_sub(visible_height)
-                                                + 1;
-                                        } else if state.sidebar_selected < state.sidebar_scroll {
-                                            state.sidebar_scroll = state.sidebar_selected;
-                                        }
+                                        ensure_sidebar_visible(&mut state, visible_height);
                                     }
                                 }
 
@@ -882,6 +1190,7 @@ fn run_app_internal(
                         }
                         KeyCode::Char('}') => {
                             if !state.file_diffs.is_empty() {
+                                state.clear_selection(); // Clear selection on hunk navigation
                                 let diff = &state.file_diffs[state.current_file];
                                 let side_by_side = compute_side_by_side(
                                     &diff.old_content,
@@ -911,6 +1220,7 @@ fn run_app_internal(
                         }
                         KeyCode::Char('{') => {
                             if !state.file_diffs.is_empty() {
+                                state.clear_selection(); // Clear selection on hunk navigation
                                 let diff = &state.file_diffs[state.current_file];
                                 let side_by_side = compute_side_by_side(
                                     &diff.old_content,
@@ -938,14 +1248,108 @@ fn run_app_internal(
                                 }
                             }
                         }
+                        KeyCode::Char('i') => {
+                            // Add annotation to focused hunk
+                            if let Some(hunk_index) = state.focused_hunk {
+                                let file_index = state.current_file;
+                                let diff = &state.file_diffs[file_index];
+
+                                // Calculate line range for this hunk
+                                let side_by_side = compute_side_by_side(
+                                    &diff.old_content,
+                                    &diff.new_content,
+                                    state.settings.tab_width,
+                                );
+                                let hunks = find_hunk_starts(&side_by_side);
+                                let hunk_start = hunks.get(hunk_index).copied().unwrap_or(0);
+                                let next_hunk_start = hunks
+                                    .get(hunk_index + 1)
+                                    .copied()
+                                    .unwrap_or(side_by_side.len());
+
+                                // Find the actual end of the hunk (last changed line, not start of next hunk)
+                                let mut actual_hunk_end = hunk_start;
+                                for i in hunk_start..next_hunk_start {
+                                    if let Some(dl) = side_by_side.get(i) {
+                                        if !matches!(dl.change_type, ChangeType::Equal) {
+                                            actual_hunk_end = i;
+                                        }
+                                    }
+                                }
+
+                                let start_line = side_by_side
+                                    .get(hunk_start)
+                                    .and_then(|dl| {
+                                        dl.new_line
+                                            .as_ref()
+                                            .map(|(n, _)| *n)
+                                            .or(dl.old_line.as_ref().map(|(n, _)| *n))
+                                    })
+                                    .unwrap_or(1);
+                                let end_line = side_by_side
+                                    .get(actual_hunk_end)
+                                    .and_then(|dl| {
+                                        dl.new_line
+                                            .as_ref()
+                                            .map(|(n, _)| *n)
+                                            .or(dl.old_line.as_ref().map(|(n, _)| *n))
+                                    })
+                                    .unwrap_or(start_line);
+
+                                let editor = AnnotationEditor::new(
+                                    file_index,
+                                    hunk_index,
+                                    diff.filename.clone(),
+                                    (start_line, end_line),
+                                );
+
+                                // If editing existing, pre-fill content
+                                let editor = if let Some(ann) = state.get_annotation(file_index, hunk_index) {
+                                    editor.with_content(&ann.content, ann.created_at)
+                                } else {
+                                    editor
+                                };
+
+                                annotation_editor = Some(editor);
+                            }
+                        }
+                        KeyCode::Char('I') => {
+                            // Open annotations menu
+                            if !state.annotations.is_empty() {
+                                let mut sorted_annotations = state.annotations.clone();
+                                sorted_annotations.sort_by_key(|a| a.created_at);
+                                let items: Vec<String> = sorted_annotations
+                                    .iter()
+                                    .map(format_annotation_preview)
+                                    .collect();
+                                active_modal = Some(Modal::annotations("Annotations", items, sorted_annotations));
+                            }
+                        }
                         KeyCode::Char('r') => {
                             state.needs_reload = true;
                         }
                         KeyCode::Char('y') => {
                             if !state.file_diffs.is_empty() {
-                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                                    let _ = clipboard
-                                        .set_text(&state.file_diffs[state.current_file].filename);
+                                // If selection is active, copy selected text
+                                if state.selection.is_active() {
+                                    let diff = &state.file_diffs[state.current_file];
+                                    let side_by_side = compute_side_by_side(
+                                        &diff.old_content,
+                                        &diff.new_content,
+                                        state.settings.tab_width,
+                                    );
+                                    if let Some(text) = extract_selected_text(&state.selection, &side_by_side) {
+                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                            let _ = clipboard.set_text(&text);
+                                        }
+                                    }
+                                    state.clear_selection();
+                                } else {
+                                    // Otherwise copy filename
+                                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                        let _ = clipboard
+                                            .set_text(&state.file_diffs[state.current_file].filename);
+                                    }
                                 }
                             }
                         }
@@ -1119,7 +1523,7 @@ fn run_app_internal(
                                             },
                                             KeyBind {
                                                 key: "enter",
-                                                description: "Open file in diff view",
+                                                description: "Open file in diff view / toggle directory",
                                             },
                                             KeyBind {
                                                 key: "space",
@@ -1186,6 +1590,19 @@ fn run_app_internal(
                                             KeyBind {
                                                 key: "ctrl+c or esc",
                                                 description: "Cancel search",
+                                            },
+                                        ],
+                                    },
+                                    KeyBindSection {
+                                        title: "Annotations",
+                                        bindings: vec![
+                                            KeyBind {
+                                                key: "i",
+                                                description: "Add annotation to focused hunk",
+                                            },
+                                            KeyBind {
+                                                key: "I",
+                                                description: "View all annotations",
                                             },
                                         ],
                                     },

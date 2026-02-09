@@ -5,8 +5,15 @@
 ![GitHub License](https://img.shields.io/github/license/jnsahaj/lumen)
 ![Crates.io Size](https://img.shields.io/crates/size/lumen)
 
-A command-line tool that uses AI to streamline your git workflow - generate commit messages, view diff and explain changes.
-![CleanShot 2025-12-30 at 02 47 04](https://github.com/user-attachments/assets/21e9d32a-de8a-40b2-b79b-3e87c9cbb9eb)
+## The missing code review tool in the era of AI coding agents.
+[![Demo](https://github.com/user-attachments/assets/dc425871-3826-4368-88d8-931b9403f0ec)](https://github.com/user-attachments/assets/70d07324-8394-423c-bbc3-9460ed84877b)
+
+## Special Thanks
+<div align="center">
+  <a href="https://coderabbit.link/lumen-oss">
+    <img width="2152" height="313" alt="image" src="https://github.com/user-attachments/assets/a2039a9d-5c9c-4a8e-a063-753c319f2e20" />
+  </a>
+</div>
 
 ## Table of Contents
 - [Features](#features-)
@@ -28,11 +35,9 @@ A command-line tool that uses AI to streamline your git workflow - generate comm
 
 ## Features 🔅
 
-- **Beautiful & Ergonomic Diff Viewer**: Review your code with minimal effort
+- **Beautiful & Ergonomic Diff Viewer**: Review your code with syntax highlighting & leave comments
 - **Smart Commit Messages**: Generate conventional commit messages for your staged changes
-- **Git History Insights**: Understand what changed in any commit, branch, or your current work
 - **Interactive Search**: Find and explore commits using fuzzy search
-- **Change Analysis**: Ask questions about specific changes and their impact
 - **Multiple AI Providers**: Supports OpenAI, Claude, Groq, Ollama, and more
 - **Flexible**: Works with any git workflow and supports multiple AI providers
 - **Rich Output**: Markdown support for readable explanations and diffs (requires: mdcat)
@@ -135,6 +140,9 @@ lumen diff --watch
 
 # Stacked mode - review commits one by one
 lumen diff main..feature --stacked
+
+# Jump to a specific file on open
+lumen diff --focus src/main.rs
 ```
 
 #### Stacked Diff Mode
@@ -184,12 +192,22 @@ LUMEN_THEME=catppuccin-mocha lumen diff
 
 Priority: CLI flag > config file > `LUMEN_THEME` env var > OS auto-detect.
 
-Keybindings in the diff viewer:
+#### Annotations
+
+Add comments to hunks during code review:
+- `i`: Add/edit annotation on focused hunk
+- `I`: View all annotations (edit, delete, copy, or export)
+
+Annotations can be copied to clipboard or exported to a file for sharing.
+
+#### Keybindings
+
 - `j/k` or arrow keys: Navigate
 - `{/}`: Jump between hunks
 - `tab`: Toggle sidebar
 - `space`: Mark file as viewed
 - `e`: Open file in editor
+- `i/I`: Add annotation / view all annotations
 - `ctrl+h/l`: Previous/next commit (stacked mode)
 - `?`: Show all keybindings
 
